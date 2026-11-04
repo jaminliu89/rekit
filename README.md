@@ -1,5 +1,7 @@
 # 溯链 · rekit
 
+[![CI](https://github.com/jaminliu89/rekit/actions/workflows/ci.yml/badge.svg)](https://github.com/jaminliu89/rekit/actions/workflows/ci.yml)
+
 > 一条命令，把逆向工程的证据链路装进你所有的 AI Agent。
 
 **溯**是追溯——REA 的核心不是工具集合，而是 `evidence_id` 串起来的证据链；
