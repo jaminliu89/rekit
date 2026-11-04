@@ -2,9 +2,9 @@
 
 [![CI](https://github.com/jaminliu89/rekit/actions/workflows/ci.yml/badge.svg)](https://github.com/jaminliu89/rekit/actions/workflows/ci.yml)
 
-> 一条命令，把逆向工程的证据链路装进你所有的 AI Agent。
+> 一条命令装好逆向链路，一个案件工作台把它跑到可判定。
 
-当前版本 **0.1.0** · [更新日志](CHANGELOG.md)
+当前版本 **0.2.0** · [更新日志](CHANGELOG.md)
 
 **溯**是追溯——REA 的核心不是工具集合，而是 `evidence_id` 串起来的证据链；
 **链**是链条——从二进制到可判定结论的那条流水线，也是把它铺到 9 个客户端的部署链。
@@ -91,6 +91,73 @@ rekit --profile desktop install --only dsh   # DSH profile 名，默认 desktop
 | `rekit skills` | 只重发技能，改完技能包后用 |
 | `rekit verify` | 端到端：切一片 Mach-O、真跑一次 Ghidra 分析、真加载一次 DSH 插件 |
 | `rekit agents` | 列出支持的 Agent 和各自状态 |
+| `rekit case` | 案件工作台：范围 → 取证 → 断言 → 判定（见下节） |
+
+---
+
+## 案件工作台
+
+装好只是前提，真正要跑的是这条线：
+
+```
+二进制 → 证据 → SPEC.md → 重建 → 判定 → 不行就再来
+```
+
+`rekit case` 把它落成五个动作：
+
+```bash
+rekit case new ./target --name my-app            # S0/S1：范围 + sha256 锁定，universal 自动切片
+rekit case capture --case ~/.rekit/cases/my-app  # S2：调 rea 取证，登记 evidence_id
+rekit case claim --statement "解析 -n 抑制换行" --kind interface \
+    --evidence ev_xxx --check "./rebuilt -n a"   # S3：可判定的断言
+rekit case check                                 # S5：逐条判定
+rekit case report                                # 结项报告
+```
+
+产物：
+
+| 文件 | 是什么 | 谁写 |
+|---|---|---|
+| `SCOPE.md` | 范围与授权、sha256、允许/禁止动作、时间盒 | `case new` |
+| `case.json` | 机器可读状态：target / evidence 索引 / claims | 工具 |
+| `evidence/*.json` | rea 的原始证据 JSON | `case capture` |
+| `SPEC.md` | 断言表 + 判定结果 | `case check` 生成，**别手改** |
+| `verdict.json` | 判定快照 | `case check` |
+| `REPORT.md` | 人读的结项报告 | `case report` |
+
+### 判定是 fail-closed 的
+
+| 单条状态 | 条件 |
+|---|---|
+| `verified` | 有 `evidence_id`，且校验命令退出码符合预期 |
+| `characterized` | 有证据没校验，或校验通过但没有证据锚点 |
+| `unknown` | 没证据 |
+| `dangling` | 引用了未登记的 `evidence_id` |
+| `contradicted` | 校验命令退出码不符 |
+
+整体状态 `ready` / `open` / `failed` / `unknown`，退出码 `0` / `1` / `2` / `1`，能直接接 CI。
+
+规矩只有一条：**没有证据的断言，写得再像也到不了 `verified`。**
+SPEC 里允许留 UNKNOWN，那不算错；把它算成已验证才是错。
+
+### 为什么 SPEC.md 是生成物
+
+如果 SPEC.md 是手写输入，判定就得解析 markdown 表格——脆弱，而且两边容易不一致。
+所以 `case.json` 是唯一输入（`rekit case claim` 写它），SPEC.md 只是它的只读视图。
+
+### 与 REA 自带台账的关系
+
+REA 有 `build-reconstruction-obligation-ledger`，输入是完整 evidence bundle 加 reviewed obligations，
+产出带闭包摘要的正式台账，适合交付级审计。`rekit case` 是它的轻量前置：日常迭代时快速判断
+「现在能不能算做完了」，需要正式台账时再把 bundle 喂给 REA。
+
+### 两处踩过的坑
+
+- **universal Mach-O**：Ghidra provider 直接拒绝，`case new` 会自动 `lipo -thin`；
+  系统二进制的架构是 `arm64e` 而不是 `arm64`。
+- **rea 有两种失败信封**：一种带 `error` 字段，另一种是 `{"code": "COMMAND_NOT_FOUND", "message": …}`。
+  只看 `error` 会把后者当成成功，于是「跑通了但没证据」——现在两种都识别，且没产出
+  `evidence_id` 一律判失败。
 
 ## 三个刻意的设计
 

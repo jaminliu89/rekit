@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-rea",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "DeepSeek Harness plugin: mount REA (reverse engineering MCP) and Craft Anything into one bundle.",
   "type": "module",
   "main": "index.js",

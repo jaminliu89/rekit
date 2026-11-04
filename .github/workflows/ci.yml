@@ -33,6 +33,10 @@ jobs:
           python rekit.py --help
           python rekit.py agents
           python rekit.py plan
+          python rekit.py case --help
+
+      - name: 案件工作台状态机
+        run: python scripts/selftest_case.py
 
       - name: 只读命令不该改工作区
         run: git diff --exit-code

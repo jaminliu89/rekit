@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -29,12 +30,13 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 HOME = Path.home()
 
 # 与 dsh-plugin-rea/package.json 的 version 保持一致（CI 会校验）
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # ---------------------------------------------------------------- 常量
 
@@ -563,6 +565,660 @@ def step_craft_register(report: Report, apply: bool, agents: list[str]) -> None:
     report.add(code == 0, "craft@agents", f"{len(clients)} 个客户端" if code == 0 else out[-160:])
 
 
+# ---------------------------------------------------------------- 案件工作台
+#
+# 把 S0–S5 从文档变成可执行的三步：
+#   rekit case new      生成案件目录（SCOPE.md + case.json），锁定 sha256
+#   rekit case capture  调 rea 取证，登记 evidence_id
+#   rekit case check    逐条判定 claim，fail-closed
+#
+# 判定规则是这套工具的核心，刻意保守：
+#   - 没有 evidence_id 的断言最多只能到 characterized，永远到不了 verified
+#   - 引用了未登记的 evidence_id 直接判 dangling（等于伪造证据）
+#   - 校验命令能跑就真跑，退出码不符判 contradicted
+# 这条规则的意义在于：结论不可能比证据更强。
+
+CASES_ROOT = Path(os.environ.get("REKIT_CASES") or (HOME / ".rekit/cases"))
+CASE_SCHEMA = "rekit.case/1"
+VERDICT_SCHEMA = "rekit.verdict/1"
+CLAIM_KINDS = ("behavior", "interface", "data", "error", "side-effect", "constraint")
+# 判定严重度：数字越大越糟，汇总时取最糟的一条
+SEVERITY = {"verified": 0, "characterized": 1, "unknown": 2, "dangling": 3, "contradicted": 4}
+
+
+def _now() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def sha256_of(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def digest_target(path: Path) -> dict:
+    """目标可能是单文件，也可能是 .app / JS 工程这种目录。
+
+    目录用「相对路径 + 大小 + 内容哈希」的确定性摘要，超过预算就停止读内容并标记
+    truncated——宁可标注能力边界，也不假装算完了。
+    """
+    if path.is_file():
+        return {"sha256": sha256_of(path), "size": path.stat().st_size, "files": 1, "truncated": False}
+
+    h = hashlib.sha256()
+    total = files = 0
+    truncated = False
+    budget = 512 << 20
+    for root, dirs, names in os.walk(path):
+        dirs.sort()
+        for name in sorted(names):
+            fp = Path(root) / name
+            if fp.is_symlink() or not fp.is_file():
+                continue
+            rel = fp.relative_to(path).as_posix()
+            size = fp.stat().st_size
+            files += 1
+            total += size
+            h.update(f"{rel}\0{size}\0".encode())
+            if truncated or total > budget:
+                truncated = True
+                h.update(b"-")
+            else:
+                h.update(bytes.fromhex(sha256_of(fp)))
+    return {"sha256": h.hexdigest(), "size": total, "files": files, "truncated": truncated}
+
+
+def file_kind(path: Path) -> str:
+    """取一行格式描述。universal 时 file(1) 会吐整段架构清单，压成一句。"""
+    exe = shutil.which("file") or "/usr/bin/file"
+    code, out = run([exe, "-b", str(path)], timeout=30)
+    if code != 0:
+        return ""
+    first = out.strip().splitlines()[0].strip() if out.strip() else ""
+    if "universal binary" in first:
+        code, archs = run(["/usr/bin/lipo", "-archs", str(path)], timeout=30)
+        return f"Mach-O universal ({', '.join(archs.split())})" if code == 0 else "Mach-O universal"
+    return first
+
+
+def thin_universal(path: Path, work: Path) -> tuple[Path, str | None]:
+    """Ghidra provider 对 universal Mach-O 直接拒绝，先切成单片。
+
+    系统二进制常见 arm64e（不是 arm64），优先级按这个来。
+    """
+    if "universal" not in file_kind(path):
+        return path, None
+    code, out = run(["/usr/bin/lipo", "-archs", str(path)], timeout=30)
+    archs = out.split() if code == 0 else []
+    for arch in ("arm64e", "arm64", "x86_64"):
+        if arch not in archs:
+            continue
+        work.mkdir(parents=True, exist_ok=True)
+        dest = work / f"{path.name}.{arch}"
+        code, _ = run(["/usr/bin/lipo", "-thin", arch, str(path), "-output", str(dest)], timeout=90)
+        if code == 0:
+            return dest, arch
+    return path, None
+
+
+def slugify(name: str) -> str:
+    return re.sub(r"[^0-9A-Za-z._-]+", "-", name).strip("-").lower() or "case"
+
+
+def case_path(arg: str | None) -> Path:
+    if arg:
+        p = Path(arg).expanduser()
+        return (p if p.is_absolute() else Path.cwd() / p).resolve()
+    if (Path.cwd() / "case.json").exists():
+        return Path.cwd()
+    raise SystemExit("找不到案件：加 --case <目录>，或先进到案件目录里执行")
+
+
+def load_case(d: Path) -> dict:
+    f = d / "case.json"
+    if not f.exists():
+        raise SystemExit(f"{d} 里没有 case.json，先 rekit case new")
+    return load_json(f)
+
+
+def save_case(d: Path, data: dict) -> None:
+    data["updated"] = _now()
+    (d / "case.json").write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+
+
+def read_verdict(d: Path) -> dict | None:
+    f = d / "verdict.json"
+    return load_json(f) if f.exists() else None
+
+
+def collect_evidence_ids(node, acc: list | None = None) -> list:
+    """证据 id 可能出现在任意深度，递归全收，去重保序。"""
+    acc = [] if acc is None else acc
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k == "evidence_id" and isinstance(v, str):
+                acc.append(v)
+            else:
+                collect_evidence_ids(v, acc)
+    elif isinstance(node, list):
+        for x in node:
+            collect_evidence_ids(x, acc)
+    return list(dict.fromkeys(acc))
+
+
+def parse_json_payload(text: str):
+    """从 rea 的输出里捞出最终 JSON。
+
+    rea 会先吐若干 JSONL 进度行（{"rea_progress": …}）再吐结果，
+    所以不能简单地「从第一个 { 开始 json.loads」——那样解析到的是进度行。
+    """
+    text = text.strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    best = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and "rea_progress" not in obj:
+            best = obj
+    if best is not None:
+        return best
+
+    # 兜底：逐位置 raw_decode，取最后一个能完整解析的对象
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(text):
+        if ch != "{":
+            continue
+        try:
+            obj, _ = decoder.raw_decode(text[i:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and "rea_progress" not in obj:
+            best = obj
+    return best
+
+
+def cell(text: str) -> str:
+    """Markdown 表格单元格：竖线要转义，换行压平。"""
+    return (text or "").replace("|", "\\|").replace("\n", " ").strip()
+
+
+def write_scope(d: Path, data: dict) -> None:
+    t = data["target"]
+    s = data["scope"]
+    thin = f"`{t['effective_path']}`（{t['arch']} 单片）" if t.get("arch") else "原件（非 universal）"
+    scale = f"{t['size']} 字节"
+    if t.get("files", 1) > 1:
+        scale = f"{t['size']} 字节 / {t['files']} 个文件"
+    if t.get("truncated"):
+        scale += "（超过 512MB 预算，只摘要了部分内容）"
+    body = f"""# SCOPE — {data['name']}
+
+> S0 范围与授权。这份文件是给人和审计看的，判定不读它。
+
+## 目标
+
+| 项 | 值 |
+|---|---|
+| 路径 | `{t['path']}` |
+| sha256 | `{t['sha256']}` |
+| 规模 | {scale} |
+| 格式 | {cell(t['kind'])} |
+| 分析用 | {thin} |
+| provider | `{data['provider']}` |
+
+## 授权
+
+| 项 | 值 |
+|---|---|
+| 授权人 | {s.get('authorized_by') or '（待填）'} |
+| 时间盒 | {s.get('timebox_hours')} 小时 |
+| 允许动作 | {', '.join(s.get('allowed') or [])} |
+| 禁止动作 | {', '.join(s.get('forbidden') or [])} |
+
+> 只分析你有权分析的产物。sha256 是这次工作的锚点：目标文件一变，
+> 之前所有证据都不再对应当前字节，必须重开案件。
+
+## 完成标准
+
+`rekit case check` 返回 `ready`：所有必需 claim 都被证据 + 校验同时支撑。
+返回 `open` 表示还有断言缺证据，`failed` 表示有断言被证据推翻或引用了不存在的证据。
+"""
+    (d / "SCOPE.md").write_text(body)
+
+
+def write_spec(d: Path, data: dict, verdict: dict | None) -> None:
+    """SPEC.md 是生成物，不是输入。避免 markdown 解析与 case.json 双份维护。"""
+    rows = []
+    by_id = {c["id"]: c for c in verdict.get("claims", [])} if verdict else {}
+    for c in data.get("claims", []):
+        v = by_id.get(c["id"], {})
+        ev = c.get("evidence") or []
+        ev_cell = ", ".join(f"`{e[:14]}…`" for e in ev[:2])
+        if len(ev) > 2:
+            ev_cell += f" +{len(ev) - 2}"
+        rows.append(
+            f"| {c['id']} | {c['kind']} | {'是' if c['required'] else '否'} | {cell(c['statement'])} "
+            f"| {v.get('verdict', '—')} | {ev_cell or '—'} | {cell(v.get('reason', c.get('note', '')))} |"
+        )
+    if not rows:
+        rows = ["| — | — | — | （还没有断言，用 `rekit case claim` 加） | — | — | — |"]
+
+    status = verdict["status"] if verdict else "unjudged"
+    summary = ""
+    if verdict:
+        s = verdict["summary"]
+        summary = (f"\n判定：**{status}** — 必需 {s['required']} 条，"
+                   f"verified {s['verified']} 条，未决 {s['required_open']} 条。\n")
+    body = f"""# SPEC — {data['name']}
+
+> 由 `rekit case check` 生成，请勿手改。改 case.json，或用 `rekit case claim` 追加断言。
+
+目标：`{data['target']['path']}`
+sha256：`{data['target']['sha256']}`
+provider：`{data['provider']}`
+{summary}
+| ID | 类型 | 必需 | 断言 | 判定 | 证据 | 说明 |
+|---|---|---|---|---|---|---|
+{chr(10).join(rows)}
+
+## 判定口径
+
+- **verified**：有 evidence_id，且校验命令通过。唯一能算「做完了」的状态。
+- **characterized**：有证据但没做校验，或校验通过但没有证据锚点。
+- **unknown**：没证据。
+- **dangling**：引用了未登记的 evidence_id。
+- **contradicted**：校验命令退出码不符，断言被推翻。
+
+没有证据的断言写进 SPEC 不算错，但永远不会被算作已验证——这就是 fail-closed。
+"""
+    (d / "SPEC.md").write_text(body)
+
+
+def judge_claim(claim: dict, evidence: dict, cwd: Path) -> dict:
+    ids = claim.get("evidence") or []
+    missing = [e for e in ids if e not in evidence]
+    if missing:
+        return {"verdict": "dangling", "reason": f"证据未登记：{', '.join(missing)}"}
+    check = claim.get("check") or {"kind": "manual"}
+    if check.get("kind") == "shell":
+        code, out = run_shell(check.get("run", ""), cwd, timeout=check.get("timeout", 120))
+        want = check.get("expect_exit", 0)
+        if code != want:
+            tail = out.strip().splitlines()[-1][:60] if out.strip() else "无输出"
+            return {"verdict": "contradicted", "reason": f"校验退出码 {code}（期望 {want}）：{tail}"}
+        if not ids:
+            return {"verdict": "characterized", "reason": "校验通过，但没有证据锚点"}
+        return {"verdict": "verified", "reason": "证据 + 校验均通过"}
+    if ids:
+        return {"verdict": "characterized", "reason": "已取证，未做校验"}
+    return {"verdict": "unknown", "reason": "无证据"}
+
+
+def run_shell(cmd: str, cwd: Path, timeout: int = 120) -> tuple[int, str]:
+    try:
+        p = subprocess.run(["/bin/sh", "-c", cmd], cwd=cwd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except subprocess.TimeoutExpired:
+        return 124, f"timeout after {timeout}s"
+
+
+def summarize(rows: list[dict]) -> dict:
+    required = [r for r in rows if r["required"]]
+    worst = max((SEVERITY[r["verdict"]] for r in rows), default=0)
+    if any(r["verdict"] in ("contradicted", "dangling") for r in rows):
+        status = "failed"
+    elif not rows:
+        status = "unknown"
+    elif any(r["verdict"] != "verified" for r in required):
+        status = "open"
+    else:
+        status = "ready"
+    return {
+        "status": status,
+        "summary": {
+            "total": len(rows),
+            "required": len(required),
+            "verified": sum(1 for r in rows if r["verdict"] == "verified"),
+            "required_open": sum(1 for r in required if r["verdict"] != "verified"),
+            "worst_severity": worst,
+        },
+    }
+
+
+# ---------------------------------------------------------------- case 子命令
+
+def case_new(args) -> int:
+    target = Path(args.target).expanduser()
+    if not target.is_absolute():
+        target = (Path.cwd() / target).resolve()
+    if not target.exists():
+        print(f"目标不存在：{target}")
+        return 2
+
+    name = args.name or target.name
+    root = Path(args.dir).expanduser() if args.dir else CASES_ROOT
+    d = root / slugify(name)
+    if (d / "case.json").exists() and not args.force:
+        print(f"案件已存在：{d}（加 --force 覆盖）")
+        return 2
+    (d / "evidence").mkdir(parents=True, exist_ok=True)
+
+    effective, arch = (target, None) if args.no_thin else thin_universal(target, d / "work")
+    digest = digest_target(target)
+    eff_digest = digest_target(effective)
+    data = {
+        "schema": CASE_SCHEMA,
+        "name": name,
+        "created": _now(),
+        "target": {
+            "path": str(target),
+            "sha256": digest["sha256"],
+            "size": digest["size"],
+            "files": digest["files"],
+            "truncated": digest["truncated"],
+            "kind": file_kind(target),
+            "arch": arch,
+            "effective_path": str(effective),
+            "effective_sha256": eff_digest["sha256"],
+        },
+        "provider": args.provider,
+        "scope": {
+            "authorized_by": "",
+            "allowed": ["静态分析", "切片", "反编译", "本地快照"],
+            "forbidden": ["执行目标", "联网抓取", "修改原件"],
+            "timebox_hours": args.timebox,
+        },
+        "claims": [],
+        "evidence": {},
+        "captures": [],
+    }
+    save_case(d, data)
+    write_scope(d, data)
+    write_spec(d, data, None)
+
+    t = data["target"]
+    print(f"{C['ok']} 案件 {d}")
+    print(f"  {C['dim']}目标  {t['path']}{C['off']}")
+    print(f"  {C['dim']}sha256 {t['sha256'][:32]}…{C['off']}")
+    print(f"  {C['dim']}格式  {cell(t['kind'])}{C['off']}")
+    if t.get("files", 1) > 1:
+        print(f"  {C['dim']}规模  {t['files']} 个文件 / {t['size']} 字节{C['off']}")
+    if t.get("truncated"):
+        print(f"  {C['warn']} 超过 512MB 摘要预算，哈希只覆盖了部分内容{C['off']}")
+    if arch:
+        print(f"  {C['dim']}切片  {t['effective_path']}（{arch}）{C['off']}")
+    print(f"\n下一步：{C['dim']}rekit case capture --case {d}{C['off']}")
+    return 0
+
+
+def error_envelope(payload, ids: list) -> tuple[bool, str, str]:
+    """识别 rea 的两种失败信封。
+
+    一种带 error 字段，另一种是 {"code": "COMMAND_NOT_FOUND", "message": …}。
+    后者没有 error 键，只看 error 字段会把它当成成功——正是踩过的坑。
+    """
+    if not isinstance(payload, dict):
+        return False, "", ""
+    if payload.get("error"):
+        return True, str(payload.get("code") or payload["error"]), str(payload.get("message") or payload["error"])
+    if not ids and isinstance(payload.get("code"), str) and payload.get("message"):
+        return True, payload["code"], str(payload["message"])
+    return False, "", ""
+
+
+def case_capture(args) -> int:
+    d = case_path(args.case)
+    data = load_case(d)
+    target = data["target"]["effective_path"]
+    provider = args.provider or data.get("provider") or "ghidra"
+
+    extra = list(args.extra)
+    while extra and extra[0] == "--":  # REMAINDER 会把分隔符也带进来
+        extra.pop(0)
+
+    if extra:
+        cmd = extra
+        if not any(a in ("--format", "--json") for a in cmd):
+            cmd = cmd + ["--format", "json"]
+        label = args.label or cmd[0]
+    else:
+        cmd = ["inspect", target, "--provider", provider, "--format", "json"]
+        label = args.label or "inspect"
+
+    code, out = rea(cmd, timeout=args.timeout)
+    payload = parse_json_payload(out)
+    n = len(data.get("captures", [])) + 1
+    stamp = _now()
+    ids = collect_evidence_ids(payload) if payload is not None else []
+    failed, err_code, err_msg = error_envelope(payload, ids)
+
+    if payload is None or failed:
+        if payload is None:
+            print(f"{C['bad']} {label}：没有解析出 JSON")
+            print(f"  {C['dim']}{out.strip()[:300]}{C['off']}")
+            err_code, err_msg = "no-json", ""
+        else:
+            print(f"{C['bad']} {label}：{brief(err_msg, 90)}")
+            detail = (payload.get("details") or {}).get("cleanup_reason") or ""
+            if detail:
+                print(f"  {C['dim']}{brief(detail)}{C['off']}")
+            print(f"  {C['dim']}code={err_code} retryable={payload.get('retryable')}{C['off']}")
+        data.setdefault("captures", []).append({
+            "label": label, "command": cmd, "ok": False, "at": stamp,
+            "error": err_code, "message": err_msg,
+        })
+        save_case(d, data)
+        return 1
+
+    rel = f"evidence/{n:02d}-{slugify(label)}.json"
+    (d / rel).write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+
+    for eid in ids:
+        data.setdefault("evidence", {})[eid] = {
+            "command": "rea " + " ".join(cmd), "at": stamp, "file": rel, "label": label,
+        }
+    data.setdefault("captures", []).append({
+        "label": label, "command": cmd, "ok": bool(ids), "at": stamp,
+        "evidence_ids": ids, "file": rel,
+        **({} if ids else {"error": "no-evidence"}),
+    })
+    save_case(d, data)
+    write_spec(d, data, read_verdict(d))
+
+    if not ids:
+        print(f"{C['bad']} {label}：跑通了但没产出 evidence_id，这条结果不能当证据用")
+        print(f"  {C['dim']}原始输出已存 {rel}，可以打开看它到底返回了什么{C['off']}")
+        return 1
+    print(f"{C['ok']} {label}：{len(ids)} 条证据 → {rel}")
+    for eid in ids[:4]:
+        print(f"  {C['dim']}{eid}{C['off']}")
+    if len(ids) > 4:
+        print(f"  {C['dim']}… 还有 {len(ids) - 4} 条{C['off']}")
+    print(f"\n下一步：{C['dim']}rekit case claim --statement '…' --evidence {ids[0]}{C['off']}")
+    return 0
+
+
+def case_claim(args) -> int:
+    d = case_path(args.case)
+    data = load_case(d)
+    claims = data.setdefault("claims", [])
+    cid = args.id or f"C{len(claims) + 1}"
+    if any(c["id"] == cid for c in claims):
+        print(f"断言已存在：{cid}")
+        return 2
+
+    known = data.get("evidence", {})
+    unknown = [e for e in (args.evidence or []) if e not in known]
+    if unknown:
+        print(f"证据未登记：{', '.join(unknown)}")
+        print(f"  {C['dim']}先 rekit case capture，或核对 evidence id{C['off']}")
+        return 2
+
+    claim = {
+        "id": cid,
+        "kind": args.kind,
+        "statement": args.statement,
+        "required": not args.optional,
+        "evidence": args.evidence or [],
+        "check": ({"kind": "shell", "run": args.check, "expect_exit": 0}
+                  if args.check else {"kind": "manual"}),
+        "note": args.note or "",
+    }
+    claims.append(claim)
+    save_case(d, data)
+    write_spec(d, data, read_verdict(d))
+    print(f"{C['ok']} {cid} 已加入（{'必需' if claim['required'] else '可选'}，"
+          f"{len(claim['evidence'])} 条证据，{'带校验' if args.check else '人工判定'}）")
+    return 0
+
+
+def case_check(args) -> int:
+    d = case_path(args.case)
+    data = load_case(d)
+    rows = []
+    for c in data.get("claims", []):
+        v = judge_claim(c, data.get("evidence", {}), d)
+        rows.append({
+            "id": c["id"], "kind": c["kind"], "statement": c["statement"],
+            "required": bool(c.get("required", True)), "evidence": c.get("evidence") or [],
+            **v,
+        })
+
+    result = summarize(rows)
+    verdict = {
+        "schema": VERDICT_SCHEMA,
+        "case": data["name"],
+        "at": _now(),
+        "target_sha256": data["target"]["sha256"],
+        "status": result["status"],
+        "summary": result["summary"],
+        "claims": rows,
+    }
+    (d / "verdict.json").write_text(json.dumps(verdict, ensure_ascii=False, indent=2) + "\n")
+    write_spec(d, data, verdict)
+
+    color = {"ready": C["ok"], "open": C["warn"], "failed": C["bad"], "unknown": C["warn"]}[result["status"]]
+    print(f"判定 {color} {result['status']}{C['off']}  {C['dim']}{d}{C['off']}")
+    if rows:
+        width = max(len(r["id"]) for r in rows) + 1
+        for r in rows:
+            mark = C["ok"] if r["verdict"] == "verified" else (
+                C["bad"] if r["verdict"] in ("contradicted", "dangling") else C["warn"])
+            flag = "" if r["required"] else C["dim"] + "(可选) "
+            print(f"  {mark} {r['id'].ljust(width)} {flag}{r['verdict']:<14} {C['dim']}{brief(r['reason'], 56)}{C['off']}")
+    s = result["summary"]
+    print(f"  {C['dim']}共 {s['total']} 条，必需 {s['required']}，verified {s['verified']}，"
+          f"未决 {s['required_open']}{C['off']}")
+    return {"ready": 0, "open": 1, "failed": 2, "unknown": 1}[result["status"]]
+
+
+def case_report(args) -> int:
+    d = case_path(args.case)
+    data = load_case(d)
+    verdict = read_verdict(d)
+    if verdict is None:
+        print("还没有判定结果，先跑 rekit case check")
+        return 2
+
+    t, s = data["target"], data["scope"]
+    rows = "\n".join(
+        f"| {r['id']} | {r['kind']} | {'是' if r['required'] else '否'} | {cell(r['statement'])} "
+        f"| **{r['verdict']}** | {cell(r['reason'])} |"
+        for r in verdict["claims"]
+    ) or "| — | — | — | — | — | — |"
+    caps = "\n".join(
+        f"| {c['label']} | {'✓' if c['ok'] else '✗'} | {len(c.get('evidence_ids') or [])} | {cell(c.get('error') or '')} |"
+        for c in data.get("captures", [])
+    ) or "| — | — | — | — |"
+    unknown = [r for r in verdict["claims"] if r["verdict"] != "verified"]
+    residuals = "\n".join(f"- `{r['id']}` {r['statement']}（{r['verdict']}）" for r in unknown) or "- 无"
+
+    body = f"""# 重建报告 — {data['name']}
+
+判定：**{verdict['status']}**
+生成时间：{verdict['at']}
+目标 sha256：`{t['sha256']}`
+provider：`{data['provider']}`
+
+## 范围
+
+- 授权人：{s.get('authorized_by') or '（未填）'}
+- 时间盒：{s.get('timebox_hours')} 小时
+- 允许：{', '.join(s.get('allowed') or [])}
+- 禁止：{', '.join(s.get('forbidden') or [])}
+
+## 取证记录
+
+| 命令 | 结果 | 证据数 | 备注 |
+|---|---|---|---|
+{caps}
+
+证据总数：{len(data.get('evidence', {}))}
+
+## 断言判定
+
+| ID | 类型 | 必需 | 断言 | 判定 | 依据 |
+|---|---|---|---|---|---|
+{rows}
+
+## 残留 UNKNOWN
+
+{residuals}
+
+---
+
+判定口径：只有「有 evidence_id 且校验命令通过」的断言才算 verified。
+没有证据的断言不会因为写得像模像样就被采纳——这是 fail-closed 的全部意义。
+"""
+    (d / "REPORT.md").write_text(body)
+    print(f"{C['ok']} {d / 'REPORT.md'}")
+    print(f"  {C['dim']}{verdict['status']}，残留 {len(unknown)} 条未验证{C['off']}")
+    return 0
+
+
+def case_list(args) -> int:
+    root = Path(args.dir).expanduser() if args.dir else CASES_ROOT
+    if not root.exists():
+        print(f"{root} 不存在，还没有案件")
+        return 0
+    found = 0
+    for d in sorted(root.iterdir()):
+        if not (d / "case.json").exists():
+            continue
+        found += 1
+        data = load_json(d / "case.json")
+        verdict = read_verdict(d)
+        status = verdict["status"] if verdict else "未判定"
+        n = len(data.get("claims", []))
+        ev = len(data.get("evidence", {}))
+        mark = {"ready": C["ok"], "open": C["warn"], "failed": C["bad"]}.get(status, C["dim"])
+        print(f"  {mark} {d.name:<24} {status:<10} {C['dim']}{n} 条断言 / {ev} 条证据  "
+              f"{data.get('target', {}).get('path', '')}{C['off']}")
+    if not found:
+        print(f"{root} 下没有案件")
+    return 0
+
+
+def cmd_case(args) -> int:
+    return {
+        "new": case_new, "capture": case_capture, "claim": case_claim,
+        "check": case_check, "report": case_report, "list": case_list,
+    }[args.case_cmd](args)
+
+
 # ---------------------------------------------------------------- 命令
 
 def cmd_doctor(args) -> int:
@@ -808,9 +1464,50 @@ def main() -> int:
     sub.add_parser("skills", help="只分发 REAP / REA / Craft 技能")
     sub.add_parser("verify", help="端到端验证")
     sub.add_parser("agents", help="列出支持的 agent")
+
+    cs = sub.add_parser("case", help="案件工作台：范围 → 取证 → 断言 → 判定")
+    csub = cs.add_subparsers(dest="case_cmd", required=True)
+
+    c_new = csub.add_parser("new", help="新建案件（生成 SCOPE.md 并锁定 sha256）")
+    c_new.add_argument("target", help="目标路径")
+    c_new.add_argument("--name", help="案件名（默认取文件名）")
+    c_new.add_argument("--provider", default="ghidra", help="分析 provider（默认 ghidra）")
+    c_new.add_argument("--dir", help=f"案件根目录（默认 {CASES_ROOT}）")
+    c_new.add_argument("--timebox", type=int, default=8, help="时间盒小时数（默认 8）")
+    c_new.add_argument("--no-thin", action="store_true", help="不自动切 universal 二进制")
+    c_new.add_argument("--force", action="store_true", help="覆盖已有案件")
+
+    c_cap = csub.add_parser("capture", help="调 rea 取证并登记 evidence_id")
+    c_cap.add_argument("--case", help="案件目录（默认当前目录）")
+    c_cap.add_argument("--provider", help="覆盖 provider")
+    c_cap.add_argument("--label", help="这条记录的标签（默认取子命令名）")
+    c_cap.add_argument("--timeout", type=int, default=600, help="超时秒数（默认 600）")
+    c_cap.add_argument("extra", nargs=argparse.REMAINDER,
+                       help="自定义 rea 子命令与参数（写在 -- 之后）")
+
+    c_claim = csub.add_parser("claim", help="追加一条断言")
+    c_claim.add_argument("--case", help="案件目录（默认当前目录）")
+    c_claim.add_argument("--statement", required=True, help="断言内容")
+    c_claim.add_argument("--kind", default="behavior", choices=CLAIM_KINDS, help="断言类型")
+    c_claim.add_argument("--evidence", nargs="*", metavar="EV_ID", help="挂哪些证据")
+    c_claim.add_argument("--check", help="校验命令；退出码非 0 判 contradicted")
+    c_claim.add_argument("--optional", action="store_true", help="可选断言（不阻塞 ready）")
+    c_claim.add_argument("--note", help="备注")
+    c_claim.add_argument("--id", help="指定 id（默认 C1、C2…）")
+
+    c_chk = csub.add_parser("check", help="逐条判定（fail-closed）")
+    c_chk.add_argument("--case", help="案件目录（默认当前目录）")
+
+    c_rep = csub.add_parser("report", help="生成 REPORT.md")
+    c_rep.add_argument("--case", help="案件目录（默认当前目录）")
+
+    c_ls = csub.add_parser("list", help="列出所有案件")
+    c_ls.add_argument("--dir", help="案件根目录")
+
     args = p.parse_args()
     return {"doctor": cmd_doctor, "plan": cmd_plan, "install": cmd_install,
-            "skills": cmd_skills, "verify": cmd_verify, "agents": cmd_agents}[args.cmd](args)
+            "skills": cmd_skills, "verify": cmd_verify, "agents": cmd_agents,
+            "case": cmd_case}[args.cmd](args)
 
 
 if __name__ == "__main__":
