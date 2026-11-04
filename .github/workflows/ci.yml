@@ -24,8 +24,12 @@ jobs:
       - name: 语法
         run: python -m py_compile rekit.py
 
+      - name: 版本一致
+        run: python scripts/check_versions.py
+
       - name: 命令可用
         run: |
+          python rekit.py --version
           python rekit.py --help
           python rekit.py agents
           python rekit.py plan

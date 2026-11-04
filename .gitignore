@@ -13,3 +13,6 @@ npm-debug.log*
 
 # macOS
 .DS_Store
+
+# 发版时临时生成的 release notes
+.release-notes*

@@ -33,6 +33,9 @@ from pathlib import Path
 
 HOME = Path.home()
 
+# 与 dsh-plugin-rea/package.json 的 version 保持一致（CI 会校验）
+__version__ = "0.1.0"
+
 # ---------------------------------------------------------------- 常量
 
 REA_BIN = HOME / ".npm-global/bin/rea"
@@ -795,6 +798,7 @@ def cmd_skills(args) -> int:
 
 def main() -> int:
     p = argparse.ArgumentParser(prog="rekit", description="逆向工程链路一键部署器")
+    p.add_argument("--version", action="version", version=f"rekit {__version__} (溯链)")
     p.add_argument("--profile", default="desktop", help="DSH profile 名（默认 desktop）")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("doctor", help="体检")
