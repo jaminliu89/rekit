@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  rekit:
+    name: rekit (python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: 语法
+        run: python -m py_compile rekit.py
+
+      - name: 命令可用
+        run: |
+          python rekit.py --help
+          python rekit.py agents
+          python rekit.py plan
+
+      - name: 只读命令不该改工作区
+        run: git diff --exit-code
+
+  plugin:
+    name: dsh-plugin-rea
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: 语法（ESM + top-level await）
+        run: node --input-type=module --check < dsh-plugin-rea/index.js
+
+      - name: 契约
+        run: |
+          node -e '
+          const fs = require("node:fs")
+          const read = (p) => fs.readFileSync(p, "utf8")
+          const pkg = JSON.parse(read("dsh-plugin-rea/package.json"))
+
+          if (pkg.type !== "module") throw new Error("必须是 ESM 包")
+
+          const patch = pkg.dsh?.bundle?.patch
+          if (!patch) throw new Error("package.json 缺 dsh.bundle.patch —— DSH 会把它当普通依赖装，而不是 profile layer")
+          if (!fs.existsSync("dsh-plugin-rea/" + patch.replace(/^\.\//, ""))) throw new Error("patch 文件不存在: " + patch)
+
+          if (pkg.dependencies?.["@deepseek-ai/dsh-mcp-client"] === undefined) throw new Error("缺 @deepseek-ai/dsh-mcp-client 依赖")
+
+          const yml = read("dsh-plugin-rea/" + patch.replace(/^\.\//, ""))
+          if (!/insert:/.test(yml)) throw new Error("patch 里没有 insert 段")
+          if (!/dsh-plugin-rea/.test(yml)) throw new Error("patch 里没挂 dsh-plugin-rea")
+
+          const src = read("dsh-plugin-rea/index.js")
+          for (const must of ["export const name", "export const inject", "export function apply"]) {
+            if (!src.includes(must)) throw new Error("index.js 缺导出: " + must)
+          }
+
+          console.log("契约 OK:", patch)
+          '
+
+      - name: 无本机绝对路径
+        run: |
+          if grep -rn "/Users/[A-Za-z0-9_.-]*/" rekit.py dsh-plugin-rea/ --include="*.py" --include="*.js" --include="*.json" --include="*.yml" --include="*.md"; then
+            echo "::error::发现硬编码的 /Users/ 路径，clone 到别人机器上会失效"
+            exit 1
+          fi
+          echo "干净"
