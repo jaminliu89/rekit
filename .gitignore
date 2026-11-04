@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# rekit 自己产生的备份与暂存
+*.rekit-backup
+.cache/
+
+# Node
+node_modules/
+npm-debug.log*
+
+# macOS
+.DS_Store

@@ -1,0 +1,18 @@
+# Mount line for dsh-plugin-rea.
+#
+# 只挂一行：本包自己在 apply() 里组装两个 MCP 服务器，
+# 所以路径全部在运行时计算，不写死机器相关的绝对路径。
+#
+# 可覆盖的配置项（全部可选）：
+#   reaBin             REA 可执行文件路径
+#   craftBin           Craft Anything CLI 路径
+#   ghidraInstallDir   Ghidra 安装目录
+#   javaHome           JDK 21 根目录
+#   hopperLauncher     Hopper 可执行文件路径
+#   analysisProvider   默认 ghidra；改成 hopper 需先授予自动化权限
+#   enable             只挂其中一部分，例如 ["rea"]
+#   toolCallTimeoutMs  工具调用超时，默认 180000
+- insert:
+    - id: rea-suite
+      name: dsh-plugin-rea
+      config: {}

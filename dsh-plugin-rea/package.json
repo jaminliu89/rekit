@@ -1,0 +1,41 @@
+{
+  "name": "dsh-plugin-rea",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness plugin: mount REA (reverse engineering MCP) and Craft Anything into one bundle.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "mcp",
+    "reverse-engineering",
+    "rea"
+  ],
+  "license": "MIT",
+  "author": "jaminliu89",
+  "homepage": "https://github.com/jaminliu89/rekit#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jaminliu89/rekit.git",
+    "directory": "dsh-plugin-rea"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-mcp-client": "^0.0.1-rc.1"
+  }
+}
